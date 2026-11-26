@@ -1,0 +1,289 @@
+/*******************************************************************************
+*
+* McStas, neutron ray-tracing package
+*         Copyright (C) 1997-2009, All rights reserved
+*         Risoe National Laboratory, Roskilde, Denmark
+*         Institut Laue Langevin, Grenoble, France
+*
+* Component: PSD_Q_monitor2
+*
+* %I
+* Written by: based on L_monitor by Kristian Nielsen and Kim Lefmann
+* Date: August 19, 2025
+* Version: $Revision: 0.1 $
+* Origin: ISIS
+* Release: McStas 3.5
+*
+* q sensitive
+*
+* %D
+* A square pixelated monitor that measures the q of the incoming
+* neutrons based on time of flight and location relative to the sample
+* the position of the sample relative to the source must be supplied.
+* The aim of this component is to account for TOF and pixel size effects
+* while calculating q without having to resort to reducing the data in 
+* e.g. Mantid. 3 operations can be performed on the detector which must be 
+* additive. e.g. A rotation about an arm + a rotation about the detector centre
+* or a linear displacement + rotation about the detector center. It is up to the 
+* to make sure that this operations are valid and produce the expected 
+* q ranges.
+*
+* Example: PSD_Q_monitor2(xwidth=0.1, yheight=0.1,
+*           nx=100, ny=100, filename="Output.L", Lmin=2, Lmax=10)
+*
+* %P
+* INPUT PARAMETERS:
+*
+* SampleArmDist: Distance to sample that is being rotated around (m)
+* DetRotX:       X rotation angle around Arm
+* DetRotY:       Y rotation angle around Arm
+* DetRotZ:       Z rotation angle around Arm
+* SampleDist:    Distance to sample from the source (m)
+* xwidth:        Width/diameter of detector (x). Overrides xmin,xmax. (m)
+* yheight:       Height of detector (y). Overrides ymin,ymax. (m)
+* nx:            Number of X channels (1)
+* ny:            Number of Y channels (1)
+* tmin:          Minimum time of flight to use
+* tmax:          Maximum time of flight to use
+* nchan:         number of q channels (1)
+* qmin:          qmin value must be +ve (AA^-1)
+* qmax:          qmax value must be +ve (AA^-1)
+* toff:          Optional TOF offset to deal with ESS lon pulse (ms)
+* filename:      Name of file in which to store the detector image (text)
+* restore_neutron: If set, the monitor does not influence the neutron state (1)
+* DetRotX2:       X rotation angle around the detector centre
+* DetRotY2:       Y rotation angle around the detector centre
+* DetRotZ2:       Z rotation angle around the detector centre
+* DetDispX:       X displacement of the detector from centre
+* DetDispY:       Y displacement of the detector from centre
+* DetDispZ:       Z displacement of the detector from centre
+* RotRot:         (1/0) Is this a rotation followed by a rotation or a translation and rotation?
+*
+* OUTPUT PARAMETERS:
+*
+* Q_N:      Array of neutron counts
+* Q_p:      Array of neutron weight counts
+* Q_p2:     Array of second moments
+*
+* %E
+*******************************************************************************/
+DEFINE COMPONENT PSD_Q_monitor2
+DEFINITION PARAMETERS ()
+SETTING PARAMETERS (SampleArmDist=4.0, DetRotX=0.0, DetRotY=0.0, DetRotZ=0.0, SampleDistance=19.0,
+                    xwidth=0, yheight=0, nx=100, ny=100, tmin=100.0, tmax=100000.0, nchan=100, 
+                    qmin=0.001, qmax=1.0, toff=0.0, string filename="",restore_neutron=0,
+                    DetRotX2=0.0, DetRotY2=0.0, DetRotZ2=0.0,
+                    DetDispX=0.0, DetDispY=0.0, DetDispZ=0.0,
+                    RotRot=1)
+                    
+OUTPUT PARAMETERS (Q_N, Q_p, Q_p2)
+//STATE PARAMETERS (x,y,z,vx,vy,vz,t,s1,s2,p)
+//POLARISATION PARAMETERS (sx,sy,sz)
+
+SHARE
+ %{
+ // function to do rotation of a coordinate as the in built functions want MCNUMs
+   void rotCoord(double *cx, double *cy, double *cz, double phx, double phy, double phz) { 
+      double cosx, sinx, cosy, siny, cosz, sinz;
+      double t00, t01, t02, t10, t11, t12, t20, t21, t22;
+
+      cosx = cos(phx*DEG2RAD);
+      sinx = sin(phx*DEG2RAD);
+      cosy = cos(phy*DEG2RAD);
+      siny = sin(phy*DEG2RAD);
+      cosz = cos(phz*DEG2RAD);
+      sinz = sin(phz*DEG2RAD);
+
+      t00 = cosy*cosz;
+      t01 = sinx*siny*cosz + cosx*sinz;
+      t02 = sinx*sinz - cosx*siny*cosz;
+      t10 = -cosy*sinz;
+      t11 = cosx*cosz - sinx*siny*sinz;
+      t12 = sinx*cosz + cosx*siny*sinz;
+      t20 = siny;
+      t21 = -sinx*cosy;
+      t22 = cosx*cosy;    
+ 
+      double lx= *cx;
+      double ly= *cy;
+      double lz= *cz;
+      
+      *cx = t00*lx + t01*ly + t02*lz;
+      *cy = t10*lx + t11*ly + t12*lz;
+      *cz = t20*lx + t21*ly + t22*lz;
+   }
+ %}
+
+DECLARE
+  %{
+    DArray1d Q_N;
+    DArray1d Q_p;
+    DArray1d Q_p2;
+    double xmin;
+    double xmax;
+    double ymin;
+    double ymax;
+  %}
+  
+INITIALIZE
+  %{
+    int i;
+
+    if ((xwidth <= 0.0) || (yheight <= 0.0)) {
+            printf("Q_monitor: %s: Null detection area !\n"
+                   "ERROR      (xwidth,yheight). Exiting",
+           NAME_CURRENT_COMP);
+      exit(0);
+    }
+
+    if (qmin <= 0.0) {
+            printf("Q_monitor: %s: qmin not defined !\n"
+                   "ERROR. Exiting", NAME_CURRENT_COMP);
+      exit(0);
+    }
+    if (qmax <= 0.0) {
+            printf("Q_monitor: %s: qmax not defined !\n"
+                   "ERROR. Exiting", NAME_CURRENT_COMP);
+      exit(0);
+    }
+
+    xmax = xwidth/2;  
+    xmin = -xmax; 
+    ymax = yheight/2; 
+    ymin = -ymax; 
+
+    Q_N = create_darr1d(nchan);
+    Q_p = create_darr1d(nchan);
+    Q_p2 = create_darr1d(nchan);
+   
+    for (i=0; i<nchan; i++)
+    {
+      Q_N[i] = 0;
+      Q_p[i] = 0;
+      Q_p2[i] = 0;
+    }
+  %}
+  
+TRACE
+  %{
+    int i,j;
+    double L,Q,qx,qy,qz,qix,qiy,qiz;
+    double dx,dy,dz,theta,R;
+    double dist,vel;
+    double z1;
+    double rx1,ry1,rz1;
+    double rx2,ry2,rz2;
+    double tx,ty,tz;
+    
+    // save the z position
+    PROP_Z0;
+
+    if (x>xmin && x<xmax && y>ymin && y<ymax)
+    {
+      // which pixel have we hit
+      i = floor((x - xmin)*nx/(xmax - xmin));
+      j = floor((y - ymin)*ny/(ymax - ymin));
+      // find the centre of the pixel we've hit
+      dx = (i*(xmax-xmin)/nx)-nx*(xmax-xmin)/(2.0*nx);
+      dy = (j*(ymax-ymin)/ny)-ny*(ymax-ymin)/(2.0*ny);
+      dz = 1.0*SampleArmDist;
+
+      // either 
+      // rotate about an arm at a distance followed by a local rotation of the detector
+      // or
+      // shift a distance in x,y,z and the perform a local roation of the detector.
+      
+      if (RotRot == 1){
+          // Perform the local rotation first.
+          // create a copy of the initial values so that more than one operation can be performed
+          rx1 = 1.0*dx;
+          ry1 = 1.0*dy;
+          rz1 = 0.0;
+          //printf("dx= %g, dy= %g \n",dx,dy);
+          rotCoord(&rx1, &ry1, &rz1, DetRotX2, DetRotY2, DetRotZ2);
+          // Now translate the detector along the beamline and rotate again about the sample
+          rx2 = 1.0*rx1;
+          ry2 = 1.0*ry1;
+          rz2 = 1.0*rz1+SampleArmDist;
+          rotCoord(&rx2, &ry2, &rz2, DetRotX, DetRotY, DetRotZ);
+      } else {
+          // Perform the local rotation first.
+          // create a copy of the initial values so that more than one operation can be performed
+          rx1 = 1.0*dx;
+          ry1 = 1.0*dy;
+          rz1 = 0.0;
+          //printf("dx= %g, dy= %g \n",dx,dy);
+          rotCoord(&rx1, &ry1, &rz1, DetRotX2, DetRotY2, DetRotZ2);
+          // Now translate the detector along the beamline
+          rx2 = 1.0*rx1+DetDispX;
+          ry2 = 1.0*ry1+DetDispY;
+          rz2 = 1.0*rz1+DetDispZ;
+      }
+      
+      // local copy just in case.
+      tx = 1.0*rx2;
+      ty = 1.0*ry2;
+      tz = 1.0*rz2;
+      
+      // now work out q in real sapce
+      R=sqrt(tx*tx+ty*ty);
+      // distance to centre of shifted detector
+      theta=atan(R/tz);
+      
+      // calculate total distance to the detector pixel
+      dist=SampleDistance+sqrt(tx*tx+ty*ty+tz*tz);
+      
+      if ((t-toff*1.0e-3)*1e6 > tmin && (t-toff*1.0e-3)*1e6 < tmax)
+      { 
+        vel=dist/(t-toff*1.0e-3);
+        L=3956.03397606/vel;
+        //printf("Lambda= %g \n",L);
+        Q = 4*PI*sin(theta/2.0)/L;
+        //printf("lam= %g theta= %g, rz %g Q=%g \n",L,theta*RAD2DEG, rz, Q);
+      
+        i = floor((Q-qmin)*nchan/(qmax-qmin));
+        if(i >= 0 && i < nchan)
+        {
+          Q_N[i]++;
+          Q_p[i] += p;
+          Q_p2[i] += p*p;
+          SCATTER;
+        }
+      }
+    } 
+    if (restore_neutron) {
+      RESTORE_NEUTRON(INDEX_CURRENT_COMP, x, y, z, vx, vy, vz, t, sx, sy, sz, p);
+    }
+  %}
+
+SAVE
+  %{
+    DETECTOR_OUT_1D(
+        "Q monitor",
+        "Q [AA^-1]",
+        "Intensity",
+        "Q", qmin, qmax, nchan,
+        &Q_N[0],&Q_p[0],&Q_p2[0],
+        filename);
+  %}
+
+FINALLY
+%{
+  destroy_darr1d(Q_N);
+  destroy_darr1d(Q_p);
+  destroy_darr1d(Q_p2);
+%}
+
+MCDISPLAY
+%{
+  magnify("xy");
+  multiline(5, (double)xmin, (double)ymin, 0.0,
+               (double)xmax, (double)ymin, 0.0,
+               (double)xmax, (double)ymax, 0.0,
+               (double)xmin, (double)ymax, 0.0,
+               (double)xmin, (double)ymin, 0.0);
+%}
+
+END
+
+

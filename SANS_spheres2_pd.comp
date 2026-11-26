@@ -1,0 +1,391 @@
+/*******************************************************************************
+*
+* McStas, neutron ray-tracing package
+*         Copyright 1997-2003, All rights reserved
+*         Risoe National Laboratory, Roskilde, Denmark
+*         Institut Laue Langevin, Grenoble, France
+*
+* Component: SANS_spheres2_pd
+*
+* %I
+* Written by: derived from SANS_spheres2 (P. Willendrup, H. Frielinghaus SANS_benchmark2)
+* Date: 22.11.2026
+* Origin: ISIS
+*
+* Sample for Small Angle Neutron Scattering - dilute hard spheres in solution, with
+* Gaussian polydispersity of the radius computed as in SasView/sasmodels.
+*
+* %D
+* Sample for Small Angle Neutron Scattering - dilute spheres in solution with a Gaussian
+* distribution of radii. Geometry, Monte Carlo sampling, incoherent background and the
+* single/multiple scattering logic are identical to SANS_spheres2. Only the coherent
+* cross-section dSigma/dOmega(Q) has changed.
+*
+* Polydispersity follows sasmodels (sphere model + GaussianDispersion):
+*
+*   - Radii R_i are npts equally spaced points in [R - nsigma*sigma, R + nsigma*sigma],
+*     where sigma = sigma_R*R (sigma_R is the *relative* width, i.e. SasView "radius_pd").
+*     Points with R_i < 0 are discarded (sasmodels lower limit for radius is 0).
+*   - Weights w_i = exp(-(R_i-R)^2 / (2 sigma^2)) (no further normalisation needed).
+*   - Volume-weighted average, as in sasmodels kernel.Iq:
+*
+*        dSigma/dOmega(Q) = phi * drho^2 * sum_i w_i V_i^2 Phi^2(Q R_i) / sum_i w_i V_i
+*
+*     with V_i = 4/3 pi R_i^3 and Phi(x) = 3(sin x - x cos x)/x^3 (sasmodels sas_3j1x_x,
+*     including its Taylor expansion for x < 0.1).
+*
+* This gives the same absolute scale as SasView with scale = phi,
+* sld - sld_solvent = drho (1e10 cm^-2 = 1e-6 AA^-2) and background = 0.
+* With sigma_R = 0 or pd_n < 2 the component reduces exactly to SANS_spheres2
+* (apart from the small-Q Taylor expansion).
+*
+* For the scattering simulation a high fraction of neutron paths is directed to the scattering (exact fraction is sc_aim).
+* The remaining paths are used for the transmitted beams. The absolute intensities are treated accordingly, and the p-parameter is set accordingly.
+*
+* For the scattering probability, the integral of the scattering function between Qmind and Qmaxd is calculated.
+* This is used in terms of transmisson, and of course for the scattering probability.
+* In this way, multiple scattering processes could be treated as well.
+* The scattered neutrons are equally distributed in this range on logarithmic Q-scales.
+*
+* Example: SANS_spheres2_pd(xwidth=0.01, yheight=0.01, zthick=0.001, dsdw_inc=0.02, sc_aim=0.97, sans_aim=0.95, R=150, sigma_R=0.1, phi=1e-3, drho=6e10)
+*
+* %P
+*
+* INPUT PARAMETERS
+*
+* xwidth:       [m]  Width of sample volume
+* yheight:      [m]  Height of sample volume
+* zthick:       [m]  Thickness of sample volume
+* R:           [AA]  Mean radius of the dilute spheres
+* sigma_R:      [1]  Relative Gaussian width of the radius distribution, sigma/R (SasView radius_pd)
+* pd_n:         [1]  Number of points in the polydispersity distribution (SasView radius_pd_n, default 35)
+* pd_nsigma:    [1]  Distribution truncated at +/- pd_nsigma standard deviations (SasView radius_pd_nsigma, default 3)
+* phi:          [1]  Volume fraction of the spheres wrt. solution
+* drho:     [cm^-2]  Scattering length density difference (contrast)
+* dsdw_inc: [cm^-1]  The incoherent background from the overall sample, should read ca. 1.0 for water, 0.5 for half D2O, half H2O, and ca. 0.02 for D2O
+* sc_aim:       [1]  The fraction of neutron paths used to represent the scattered neutrons (including everything: incoherent and coherent). rest is transmission.
+* sans_aim:     [1]  The fraction of neutron paths used to represent the scattered neutrons in the sans-range (up to Qmaxd). rest is incoherent with Q>Qmaxd.
+* singlesp:     [1]  Switches between multiple scattering (0) and single scattering (1). Up to 10 scattering processes are considered.
+* Qmind:    [AA^-1]  Lower limit of "SANS" scattering
+* Qmaxd:    [AA^-1]  Upper limit of "SANS" scattering
+*
+* %Link
+* SANS_spheres2
+* %Link
+* sasmodels: https://github.com/SasView/sasmodels (models/sphere.py, weights.py, kernel.py)
+*
+* %E
+*******************************************************************************/
+
+DEFINE COMPONENT SANS_spheres2_pd
+
+SETTING PARAMETERS (xwidth=0.01, yheight=0.01, zthick=0.001, dsdw_inc=0.02, sc_aim=0.97, sans_aim=0.95,
+                    R=150, sigma_R=0.1, int pd_n=35, pd_nsigma=3, phi=1e-3, drho=6e10,
+                    int singlesp=1, Qmind=0.0001, Qmaxd=2.1544346900319)
+
+SHARE
+%{
+  /* Prefixed helpers so this component can coexist with SANS_spheres2 in one instrument */
+
+  #pragma acc routine seq
+  double SSPD_Min (double A, double B) { return (A < B) ? A : B; }
+
+  #pragma acc routine seq
+  double SSPD_Max (double A, double B) { return (A > B) ? A : B; }
+
+  #pragma acc routine seq
+  int SSPD_IMin (int A, int B) { return (A < B) ? A : B; }
+
+  #pragma acc routine seq
+  int SSPD_IMax (int A, int B) { return (A > B) ? A : B; }
+
+  /* 3 j1(x)/x, as sasmodels lib/sas_3j1x_x.c (double precision: 4th order series below x=0.1) */
+  #pragma acc routine seq
+  double SSPD_3j1x_x (double x) {
+    if (fabs (x) < 0.1) {
+      double x2 = x * x;
+      return 1.0 + x2 * (-3. / 30. + x2 * (3. / 840. + x2 * (-3. / 45360.)));
+    }
+    return 3.0 * (sin (x) / x - cos (x)) / (x * x);
+  }
+
+  /* Polydisperse dSigma/dOmega [cm^-1].
+     rad[i] are the radii [AA], coef[i] = phi*drho^2*1e-24 * w_i V_i^2 / sum_j(w_j V_j),
+     precomputed in INITIALIZE, so that I(Q) = sum_i coef[i] * Phi^2(Q rad[i]). */
+  #pragma acc routine seq
+  double SSPD_dSigdW (double Q, int n, DArray1d rad, DArray1d coef) {
+    double out = 0.0, f;
+    int i;
+    for (i = 0; i < n; i++) {
+      f = SSPD_3j1x_x (Q * rad[i]);
+      out += coef[i] * f * f;
+    }
+    return out;
+  }
+%}
+
+DECLARE
+%{
+  DArray1d Idsdw;
+  DArray1d pd_rad;
+  DArray1d pd_coef;
+  int pd_npts;
+  double Qminl;
+  double Qmaxl;
+  double l10;
+%}
+
+INITIALIZE
+%{
+  if (!xwidth || !yheight || !zthick) {
+    exit (fprintf (stderr, "%s:\t sample has no volume (zero dimensions)\n", NAME_CURRENT_COMP));
+  }
+  if (R <= 0) {
+    exit (fprintf (stderr, "%s:\t mean radius R must be > 0\n", NAME_CURRENT_COMP));
+  }
+  if (sigma_R < 0 || pd_nsigma <= 0) {
+    exit (fprintf (stderr, "%s:\t sigma_R must be >= 0 and pd_nsigma > 0\n", NAME_CURRENT_COMP));
+  }
+
+  int iii, kkk;
+
+  /* ---- Gaussian polydispersity weights, sasmodels GaussianDispersion ---- */
+  {
+    int nmax = (sigma_R == 0 || pd_n < 2) ? 1 : pd_n;
+    double sigma = sigma_R * R;
+    double sum_wV = 0.0, Ri, wi, Vi;
+    double *wtmp = (double *)malloc (nmax * sizeof (double));
+
+    pd_rad = create_darr1d (nmax);
+    pd_coef = create_darr1d (nmax);
+    pd_npts = 0;
+
+    for (iii = 0; iii < nmax; iii++) {
+      if (nmax == 1) {
+        Ri = R;
+        wi = 1.0;
+      } else {
+        /* np.linspace(-nsigma*sigma, +nsigma*sigma, npts) about R */
+        Ri = R + pd_nsigma * sigma * (-1.0 + 2.0 * iii / (double)(nmax - 1));
+        if (Ri < 0.0)
+          continue; /* sasmodels: x[(x >= lb) & (x <= ub)], lb = 0 for radius */
+        wi = exp ((Ri - R) * (Ri - R) / (-2.0 * sigma * sigma));
+      }
+      Vi = 4.0 * PI / 3.0 * Ri * Ri * Ri;
+      pd_rad[pd_npts] = Ri;
+      wtmp[pd_npts] = wi;
+      sum_wV += wi * Vi;
+      pd_npts++;
+    }
+    for (iii = 0; iii < pd_npts; iii++) {
+      Vi = 4.0 * PI / 3.0 * pd_rad[iii] * pd_rad[iii] * pd_rad[iii];
+      /* 1e-24: AA^3 -> cm^3 ; drho in cm^-2 ; result in cm^-1 */
+      pd_coef[iii] = (sum_wV > 0) ? phi * drho * drho * 1e-24 * wtmp[iii] * Vi * Vi / sum_wV : 0.0;
+    }
+    free (wtmp);
+
+    MPI_MASTER (printf ("%s: Gaussian polydispersity, <R>=%g AA, sigma/R=%g, %d points over +/-%g sigma\n", NAME_CURRENT_COMP, R, sigma_R, pd_npts,
+                        pd_nsigma););
+  }
+
+  Qminl = log10 (Qmind);
+  Qmaxl = log10 (Qmaxd);
+  l10 = log (10.00);
+
+  double q, Isq;
+  double qmin, qmax, step;
+  int istp;
+
+  istp = floor ((Qmaxl - Qminl) * 300.0 + 0.5);
+
+  Idsdw = create_darr1d (31);
+
+  /* By integration, calculate the coherent scattering cross-section for the relevant wavelength range */
+  for (iii = 1; iii <= 30; iii++) { /* wavelength in AA, up to 30 */
+    Idsdw[iii] = 0.0;
+    Isq = 0.0;
+    qmin = 0.0;
+    step = (log10 (SSPD_Min (Qmaxd, 4.0 * PI / iii)) - Qminl) / istp;
+    for (kkk = 0; kkk <= istp; kkk++) {
+      qmax = pow (10.0, Qminl + kkk * step);
+      q = 0.5 * (qmin + qmax);
+      Isq += SSPD_dSigdW (q, pd_npts, pd_rad, pd_coef) * q * (qmax - qmin);
+      qmin = qmax;
+    };
+    Idsdw[iii] = Isq;
+  };
+%}
+
+TRACE
+%{
+  double v, k0, lambda;
+  int Ilam, Ilam2;
+  double qmax, qmaxl, Ymax, Xmax, thmax;
+
+  /* Wavelength-dependent cross-section variables for cross-section terms */
+  double Scoh, Sinc1, Sinc2, Stot;
+
+  double rcut, fcut;
+  double Q, Xsc, theta;
+  int iscatt;
+
+  char intersect;
+  double t0, t1, dt, phiROT;
+
+  double axis_x, axis_y, axis_z;
+  double tmp_vx, tmp_vy, tmp_vz, vout_x, vout_y, vout_z;
+
+  /* Number of scatterings in sample - limit at 10 below */
+  iscatt = 0;
+
+  v = sqrt (vx * vx + vy * vy + vz * vz);
+  k0 = v / K2V;
+  lambda = 2.0 * PI / k0;
+
+  Ilam = SSPD_IMax (floor (lambda), 1);
+  Ilam2 = SSPD_IMin (Ilam + 1, 30);
+  /* Coherent "SANS" scattering  - in 3 intervals, asymptotic values at the low and high WL end */
+  if (lambda <= 1.0)
+    Scoh = 200.0 * PI * Idsdw[1] / (k0 * k0);
+  else {
+    if (lambda >= 30.0)
+      Scoh = 200.0 * PI * Idsdw[30] / (k0 * k0);
+    else
+      Scoh = 200.0 * PI * ((Ilam2 - lambda) * Idsdw[Ilam] + (lambda - Ilam) * Idsdw[Ilam2]) / (k0 * k0);
+  };
+
+  /* Scattering triangle consideration, limit to lowest of either Qmaxd or double initial k0 value */
+  qmax = SSPD_Min (Qmaxd, 2.0 * k0);
+  qmaxl = log10 (qmax);
+
+  Ymax = 0.25 * qmax * qmax / (k0 * k0);
+  if (Ymax >= 0.9999)
+    Ymax = 1.0; /* if rounding errors occurr, this will help to avoid problems */
+  Xmax = 1.0 - 2.0 * Ymax;
+  thmax = acos (Xmax);
+
+  /* Incoherent "forward" scattering */
+  Sinc1 = 100.0 * PI * (qmax * qmax / (k0 * k0)) * fabs (dsdw_inc);
+  /* non-directional incoherent scattering */
+  Sinc2 = 100.0 * PI * (4.0 - qmax * qmax / (k0 * k0)) * fabs (dsdw_inc);
+
+  Stot = Sinc1 + Sinc2 + Scoh;
+
+  intersect = box_intersect (&t0, &t1, x, y, z, vx, vy, vz, xwidth, yheight, zthick);
+
+  if (intersect && Stot > 0.0) {
+
+    if (t0 < 0.0)
+      ABSORB;
+
+    rcut = exp (-Stot * (t1 - t0) * v);
+
+    if (1.0 - rcut > sc_aim) {
+      dt = -1.0 / (v * Stot) * log (rand01 ());
+    } else {
+      if (rand01 () <= sc_aim) {
+        dt = -1.0 / (v * Stot) * log (1.0 - (1.0 - rcut) * rand01 ());
+        p *= (1.0 - rcut) / sc_aim;
+      } else {
+        dt = 1e33; /* transmit: run out of sample */
+        p *= rcut / (1.0 - sc_aim);
+      };
+    };
+
+    if (t0 + dt <= t1) {
+      PROP_DT (t0 + dt);
+      SCATTER;
+      iscatt = 1;
+
+      fcut = SSPD_Max (Ymax, sans_aim);
+
+      if (rand01 () <= fcut) {
+        /* Random Q in the SANS regime - logarithmic sampling */
+        Q = pow (10.0, Qminl + (qmaxl - Qminl) * rand01 ());
+        double dsdw = SSPD_dSigdW (Q, pd_npts, pd_rad, pd_coef);
+        p *= 200.0 * PI * Q * Q / (k0 * k0) * (qmaxl - Qminl) * l10 * (dsdw + fabs (dsdw_inc)) / (Stot * fcut);
+        Xsc = 1.0 - 0.5 * (Q * Q / (k0 * k0));
+        theta = 2.0 * asin (0.5 * Q / k0);
+      } else {
+        Xsc = -1.0 + (Xmax + 1.0) * rand01 ();
+        p *= (1.0 - Ymax) / (1.0 - fcut);
+        theta = acos (Xsc);
+      }
+      phiROT = 2.0 * PI * rand01 ();
+
+      vec_prod (axis_x, axis_y, axis_z, vx, vy, vz, 0, 1, 0);
+      rotate (tmp_vx, tmp_vy, tmp_vz, vx, vy, vz, theta, axis_x, axis_y, axis_z);
+      rotate (vout_x, vout_y, vout_z, tmp_vx, tmp_vy, tmp_vz, phiROT, vx, vy, vz);
+
+      vx = vout_x;
+      vy = vout_y;
+      vz = vout_z;
+
+      /* Multiple scattering */
+      while (iscatt < 10 && singlesp == 0) {
+
+        intersect = box_intersect (&t0, &t1, x, y, z, vx, vy, vz, xwidth, yheight, zthick);
+        if (!intersect)
+          ABSORB;
+
+        dt = -1.0 / (v * Stot) * log (rand01 ());
+
+        if (dt <= t1) {
+          PROP_DT (dt);
+          SCATTER;
+          iscatt++;
+
+          fcut = SSPD_Max (Ymax, sans_aim);
+
+          if (rand01 () <= fcut) {
+            Q = pow (10.0, Qminl + (qmaxl - Qminl) * rand01 ());
+            double dsdw = SSPD_dSigdW (Q, pd_npts, pd_rad, pd_coef);
+            p *= 200.0 * PI * Q * Q / (k0 * k0) * (qmaxl - Qminl) * l10 * (dsdw + fabs (dsdw_inc)) / (Stot * fcut);
+            Xsc = 1.0 - 0.5 * (Q * Q / (k0 * k0));
+            theta = 2.0 * asin (0.5 * Q / k0);
+          } else {
+            Xsc = -1.0 + (Xmax + 1.0) * rand01 ();
+            p *= (1.0 - Ymax) / (1.0 - fcut);
+            theta = acos (Xsc);
+          };
+
+          phiROT = 2.0 * PI * rand01 ();
+
+          vec_prod (axis_x, axis_y, axis_z, vx, vy, vz, 0, 1, 0);
+          rotate (tmp_vx, tmp_vy, tmp_vz, vx, vy, vz, theta, axis_x, axis_y, axis_z);
+          rotate (vout_x, vout_y, vout_z, tmp_vx, tmp_vy, tmp_vz, phiROT, vx, vy, vz);
+
+          vx = vout_x;
+          vy = vout_y;
+          vz = vout_z;
+        } else
+          break;
+      };
+
+      intersect = box_intersect (&t0, &t1, x, y, z, vx, vy, vz, xwidth, yheight, zthick);
+      if (!intersect)
+        ABSORB;
+      if (singlesp == 1) {
+        p *= exp (-v * t1 * Stot); /* Attenuate beam if no multiple scattering is simulated */
+      }
+      PROP_DT (t1);
+
+    } else {
+      PROP_DT (t1);
+    };
+  };
+%}
+
+FINALLY
+%{
+  destroy_darr1d (Idsdw);
+  destroy_darr1d (pd_rad);
+  destroy_darr1d (pd_coef);
+%}
+
+MCDISPLAY
+%{
+  box (0, 0, 0, xwidth, yheight, zthick);
+%}
+END
+
